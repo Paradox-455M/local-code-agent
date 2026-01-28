@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+
+# virtualenvs
+.venv/
+venv/
+
+# packaging
+build/
+dist/
+*.egg-info/
+
+# local logs/artifacts
+logs/
+*.log
+*.jsonl
+
+# patch backups created by tools/apply_patch.py
+*.bak
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

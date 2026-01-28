@@ -1,0 +1,14 @@
+# CLI framework for commands and argument parsing
+typer>=0.12
+
+# Rich terminal output (color, tables) for offline UX
+rich>=13.7
+
+# Local HTTP client to call the Ollama server
+httpx>=0.26
+
+# Git integration for status/diff/context without shell parsing
+GitPython>=3.1
+
+# Resource monitoring
+psutil>=5.9.0
