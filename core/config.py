@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 try:
     from core.config_file import load_config, get_config_value
@@ -60,6 +60,15 @@ class Config:
     # Git integration
     auto_commit: bool = os.getenv("LCA_AUTO_COMMIT", "false").lower() == "true"
     auto_branch: bool = os.getenv("LCA_AUTO_BRANCH", "false").lower() == "true"
+    # Performance: skip KG/semantic for faster runs (env: LCA_FAST_MODE, LCA_USE_KNOWLEDGE_GRAPH)
+    fast_mode: bool = os.getenv("LCA_FAST_MODE", "false").lower() in ("true", "1", "yes")
+    use_knowledge_graph: bool = os.getenv("LCA_USE_KNOWLEDGE_GRAPH", "true").lower() in ("true", "1", "yes")
+    # Summary caching and LLM summaries
+    summary_mode: str = os.getenv("LCA_SUMMARY_MODE", "struct")  # struct|llm|hybrid
+    summary_max_bytes: int = int(os.getenv("LCA_SUMMARY_MAX_BYTES", "4000"))
+    summary_chunk_lines: int = int(os.getenv("LCA_SUMMARY_CHUNK_LINES", "120"))
+    summary_max_chunks: int = int(os.getenv("LCA_SUMMARY_MAX_CHUNKS", "8"))
+    graph_cache_ttl: int = int(os.getenv("LCA_GRAPH_CACHE_TTL", "300"))
     _config_file_data: Optional[dict] = None
     
     def __post_init__(self):
@@ -69,11 +78,13 @@ class Config:
     def _load_config_file(self, profile: Optional[str] = None):
         """Load configuration from file."""
         try:
+            if self.fast_mode:
+                self.use_knowledge_graph = False
             repo_str = str(self.repo_root)
             file_config = load_config(repo_str, profile=profile)
             if file_config:
                 self._config_file_data = file_config
-                
+
                 # Override with config file values (if not set via env)
                 if "agent" in file_config:
                     agent_cfg = file_config["agent"]

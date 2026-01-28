@@ -75,6 +75,19 @@ pip install -e .
 - Optional hash guard via `apply_patch` for stricter safety (used internally as needed).
 - If diffs look malformed, they are rejected; the agent may retry with a stricter prompt or ask for clarification.
 
+## Performance & bottlenecks
+- **Fast mode**: `LCA_FAST_MODE=1` skips knowledge graph, semantic search, and call-graph construction. Use for quicker runs when you don’t need deep codebase discovery.
+- **Disable KG only**: `LCA_USE_KNOWLEDGE_GRAPH=0` turns off KG/semantic/call-graph but keeps other features. `LCA_FAST_MODE=1` implies this.
+- **Explicit files**: `-f path/to/file.py` (or multiple `-f` paths) skips intelligent context building and uses basic context. Faster when you already know which files to touch.
+- **Output token limit**: If diffs are truncated, set `LCA_NUM_PREDICT=8192` (or higher). Default `-1` means no limit.
+- **Summary mode**: `LCA_SUMMARY_MODE=struct|llm|hybrid` controls per-file summaries. `struct` uses AST structure only; `llm` uses LLM map-reduce summaries; `hybrid` uses both.
+- **Summary budgets**: `LCA_SUMMARY_MAX_BYTES`, `LCA_SUMMARY_CHUNK_LINES`, `LCA_SUMMARY_MAX_CHUNKS` tune summary size and map-reduce chunking.
+- **Graph cache TTL**: `LCA_GRAPH_CACHE_TTL=300` controls how long KG/call-graph snapshots are reused.
+- **Persistent caches**:
+  - `.lca/summary.json` per-file summaries
+  - `.lca/semantic_index/` embeddings + chunks
+  - `.lca/graph_cache.json` KG/call-graph snapshot
+
 ## Troubleshooting
 - Missing dependencies: install with `pip install -e .` (typer, rich, httpx, GitPython).
 - Model not available: `ollama pull <model>` or set `LCA_MODEL`.

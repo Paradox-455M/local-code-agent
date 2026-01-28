@@ -8,17 +8,25 @@ from typing import List, Dict, Set, Optional, Tuple
 from collections import defaultdict
 
 try:
-    from memory.symbols import extract_symbols, Symbol, find_files_with_symbol
+    from memory.symbols import extract_symbols, Symbol, FileSymbols, find_files_with_symbol
     from memory.dependencies import build_dependency_graph, DependencyGraph
     from memory.index import scan_repo
     from memory.knowledge_graph import build_codebase_graph, CodebaseGraph
     from memory.call_graph import build_call_graph, CallGraphBuilder
     from memory.semantic_search import create_semantic_search, SemanticCodeSearch
+    from memory.graph_cache import GraphCache
+    from memory.summary_cache import SummaryCache
+    from core.llm import ask
+    from core.config import config as _config
 except ImportError:
+    _config = None  # type: ignore
+    SummaryCache = None  # type: ignore
+    GraphCache = None  # type: ignore
+    ask = None  # type: ignore
     import sys
     from pathlib import Path
     sys.path.append(str(Path(__file__).resolve().parent.parent))
-    from memory.symbols import extract_symbols, Symbol, find_files_with_symbol
+    from memory.symbols import extract_symbols, Symbol, FileSymbols, find_files_with_symbol
     from memory.dependencies import build_dependency_graph, DependencyGraph
     from memory.index import scan_repo
     try:
@@ -68,34 +76,77 @@ class Context:
         self.snippets.sort(key=lambda s: -s.relevance_score)
     
     def prune(self, max_bytes: Optional[int] = None) -> None:
-        """Prune context to fit within byte limit."""
+        """Prune context to fit within byte limit with adaptive budgets."""
         max_bytes = max_bytes or self.max_bytes
         pruned: List[CodeSnippet] = []
         current_bytes = 0
-        
-        for snippet in self.snippets:
+
+        summary_types = {"structure", "summary"}
+        test_types = {"test"}
+
+        # Budgets: prioritize summaries, then code, then tests
+        summary_budget = int(max_bytes * 0.3)
+        code_budget = int(max_bytes * 0.6)
+        test_budget = max_bytes - summary_budget - code_budget
+
+        def _add_snippet(snippet: CodeSnippet, remaining: int) -> int:
+            nonlocal pruned
             snippet_bytes = len(snippet.content.encode("utf-8"))
-            if current_bytes + snippet_bytes <= max_bytes:
+            if snippet_bytes <= remaining:
                 pruned.append(snippet)
-                current_bytes += snippet_bytes
-            else:
-                # Try to fit partial snippet
-                remaining = max_bytes - current_bytes
-                if remaining > 100:  # Only if meaningful space left
-                    partial = snippet.content[:remaining]
-                    pruned.append(CodeSnippet(
-                        path=snippet.path,
-                        content=partial + "\n... (truncated)",
-                        start_line=snippet.start_line,
-                        end_line=snippet.end_line,
-                        relevance_score=snippet.relevance_score,
-                        snippet_type=snippet.snippet_type,
-                        symbols=snippet.symbols
-                    ))
-                break
-        
+                return snippet_bytes
+            if remaining > 100:
+                partial = snippet.content[:remaining]
+                pruned.append(CodeSnippet(
+                    path=snippet.path,
+                    content=partial + "\n... (truncated)",
+                    start_line=snippet.start_line,
+                    end_line=snippet.end_line,
+                    relevance_score=snippet.relevance_score,
+                    snippet_type=snippet.snippet_type,
+                    symbols=snippet.symbols,
+                ))
+                return remaining
+            return 0
+
+        def _consume(snippets: List[CodeSnippet], budget: int) -> int:
+            used = 0
+            for snippet in snippets:
+                remaining = budget - used
+                if remaining <= 0:
+                    break
+                used += _add_snippet(snippet, remaining)
+            return used
+
+        summaries = [s for s in self.snippets if s.snippet_type in summary_types]
+        tests = [s for s in self.snippets if s.snippet_type in test_types]
+        code = [s for s in self.snippets if s.snippet_type not in summary_types | test_types]
+
+        summaries.sort(key=lambda s: -s.relevance_score)
+        code.sort(key=lambda s: -s.relevance_score)
+        tests.sort(key=lambda s: -s.relevance_score)
+
+        current_bytes += _consume(summaries, summary_budget)
+        current_bytes += _consume(code, code_budget)
+        current_bytes += _consume(tests, test_budget)
+
+        # If we still have room, fill with highest remaining relevance
+        remaining = max_bytes - current_bytes
+        if remaining > 100:
+            used_paths = {(s.path, s.start_line, s.end_line, s.snippet_type) for s in pruned}
+            leftovers = [
+                s for s in self.snippets
+                if (s.path, s.start_line, s.end_line, s.snippet_type) not in used_paths
+            ]
+            leftovers.sort(key=lambda s: -s.relevance_score)
+            for snippet in leftovers:
+                if remaining <= 0:
+                    break
+                added = _add_snippet(snippet, remaining)
+                remaining -= added
+
         self.snippets = pruned
-        self.total_bytes = current_bytes
+        self.total_bytes = sum(len(s.content.encode("utf-8")) for s in pruned)
     
     def to_dict_list(self) -> List[Dict[str, str]]:
         """Convert to list of dicts for executor compatibility."""
@@ -113,13 +164,13 @@ class Context:
 class IntelligentContextBuilder:
     """Builds intelligent context like Claude Code."""
     
-    def __init__(self, repo_root: Path, use_knowledge_graph: bool = True):
+    def __init__(self, repo_root: Path, use_knowledge_graph: Optional[bool] = None):
         """
         Initialize context builder.
-        
+
         Args:
             repo_root: Root directory of the repository.
-            use_knowledge_graph: Whether to use knowledge graph for better context.
+            use_knowledge_graph: Whether to use KG/semantic. Defaults to config.use_knowledge_graph.
         """
         self.repo_root = Path(repo_root).resolve()
         self.dependency_graph: Optional[DependencyGraph] = None
@@ -127,20 +178,35 @@ class IntelligentContextBuilder:
         self.call_graph: Optional[CallGraphBuilder] = None
         self.semantic_search: Optional[SemanticCodeSearch] = None
         self._symbol_cache: Dict[str, List[Symbol]] = {}
-        self.use_knowledge_graph = use_knowledge_graph and CodebaseGraph is not None
-        
+        if use_knowledge_graph is None and _config is not None:
+            use_knowledge_graph = getattr(_config, "use_knowledge_graph", True)
+        self.use_knowledge_graph = bool(use_knowledge_graph) and CodebaseGraph is not None
+
+        self.summary_cache = SummaryCache(self.repo_root) if SummaryCache else None
+        self.summary_mode = getattr(_config, "summary_mode", "struct") if _config else "struct"
+        self.summary_max_bytes = getattr(_config, "summary_max_bytes", 4000) if _config else 4000
+        self.summary_chunk_lines = getattr(_config, "summary_chunk_lines", 120) if _config else 120
+        self.summary_max_chunks = getattr(_config, "summary_max_chunks", 8) if _config else 8
+
         if self.use_knowledge_graph:
             self._initialize_knowledge_graph()
     
     def _initialize_knowledge_graph(self) -> None:
         """Initialize knowledge graph and related structures."""
         try:
-            if build_codebase_graph:
+            if GraphCache:
+                cache = GraphCache(self.repo_root)
+                cached = cache.load()
+                if cached:
+                    self.knowledge_graph, self.call_graph = cached
+            if build_codebase_graph and self.knowledge_graph is None:
                 self.knowledge_graph = build_codebase_graph(self.repo_root)
-            if build_call_graph and self.knowledge_graph:
+            if build_call_graph and self.knowledge_graph and self.call_graph is None:
                 self.call_graph = build_call_graph(self.repo_root, self.knowledge_graph)
             if create_semantic_search:
                 self.semantic_search = create_semantic_search(self.repo_root)
+            if GraphCache and self.knowledge_graph and self.call_graph:
+                GraphCache(self.repo_root).save(self.knowledge_graph, self.call_graph)
         except Exception:
             # If knowledge graph building fails, continue without it
             self.use_knowledge_graph = False
@@ -374,6 +440,49 @@ class IntelligentContextBuilder:
         
         # Extract symbols from file
         file_symbols = extract_symbols(full_path, use_cache=True)
+        content_hash = self.summary_cache.compute_hash(content) if self.summary_cache else ""
+        cached = self.summary_cache.get(file_path, content_hash) if self.summary_cache else None
+
+        is_large = len(content.encode("utf-8")) >= 2000
+        structure_summary = cached.structure if cached else None
+        if structure_summary is None and (self.summary_mode in ("struct", "hybrid")):
+            structure_summary = self._build_structure_summary(file_symbols)
+            if structure_summary and self.summary_cache:
+                self.summary_cache.set(
+                    file_path,
+                    content_hash,
+                    full_path.stat().st_mtime if full_path.exists() else 0.0,
+                    structure=structure_summary,
+                )
+
+        if structure_summary and self.summary_mode in ("struct", "hybrid"):
+            snippets.append(CodeSnippet(
+                path=file_path,
+                content=structure_summary,
+                relevance_score=60.0 if is_primary else 25.0,
+                snippet_type="structure",
+                symbols=[s.name for s in file_symbols.symbols],
+            ))
+
+        llm_summary = cached.llm if cached else None
+        if llm_summary is None and is_large and self.summary_mode in ("llm", "hybrid"):
+            llm_summary = self._generate_llm_summary(file_path, content, file_symbols)
+            if llm_summary and self.summary_cache:
+                self.summary_cache.set(
+                    file_path,
+                    content_hash,
+                    full_path.stat().st_mtime if full_path.exists() else 0.0,
+                    llm=llm_summary,
+                )
+
+        if llm_summary and self.summary_mode in ("llm", "hybrid"):
+            snippets.append(CodeSnippet(
+                path=file_path,
+                content=llm_summary,
+                relevance_score=70.0 if is_primary else 35.0,
+                snippet_type="summary",
+                symbols=[s.name for s in file_symbols.symbols],
+            ))
         
         # If file is small, include entire file
         if len(content.encode("utf-8")) < 2000:
@@ -445,6 +554,104 @@ class IntelligentContextBuilder:
             snippets.append(snippet)
         
         return snippets
+
+    def _build_structure_summary(self, file_symbols: "FileSymbols") -> str:
+        """Build a compact structural summary using symbols and imports."""
+        imports = file_symbols.imports[:12]
+        functions = [s for s in file_symbols.symbols if s.kind == "function"]
+        classes = [s for s in file_symbols.symbols if s.kind == "class"]
+        methods = [s for s in file_symbols.symbols if s.kind == "method"]
+
+        methods_by_class: Dict[str, List[Symbol]] = defaultdict(list)
+        for m in methods:
+            if m.parent:
+                methods_by_class[m.parent].append(m)
+
+        lines: List[str] = ["# structure summary (auto)"]
+
+        if imports:
+            lines.append("imports:")
+            lines.append("- " + ", ".join(imports))
+
+        if classes:
+            lines.append("classes:")
+            for cls in classes[:8]:
+                cls_methods = methods_by_class.get(cls.name, [])[:8]
+                if cls_methods:
+                    sigs = [f"{m.name}{m.signature or '()'}" for m in cls_methods]
+                    lines.append(f"- {cls.name}: {', '.join(sigs)}")
+                else:
+                    lines.append(f"- {cls.name}")
+
+        if functions:
+            lines.append("functions:")
+            for fn in functions[:12]:
+                lines.append(f"- {fn.name}{fn.signature or '()'}")
+
+        # Keep summary compact
+        summary = "\n".join(lines).strip()
+        if len(summary.encode("utf-8")) > 2000:
+            summary = summary[:2000] + "\n... (truncated)"
+        return summary if len(lines) > 1 else ""
+
+    def _summary_chunks(self, content: str, file_symbols: "FileSymbols") -> List[str]:
+        """Split a large file into summary chunks using symbols or line ranges."""
+        lines = content.splitlines()
+        symbol_lines = sorted({s.line - 1 for s in file_symbols.symbols if s.line})
+        chunks: List[str] = []
+        if symbol_lines:
+            groups = self._group_nearby_lines(symbol_lines, max_gap=40)
+            for group in groups[:self.summary_max_chunks]:
+                start = max(0, group[0] - 10)
+                end = min(len(lines), group[-1] + 30)
+                chunks.append("\n".join(lines[start:end]))
+        else:
+            for idx in range(0, len(lines), self.summary_chunk_lines):
+                if len(chunks) >= self.summary_max_chunks:
+                    break
+                end = min(len(lines), idx + self.summary_chunk_lines)
+                chunks.append("\n".join(lines[idx:end]))
+        return [c for c in chunks if c.strip()]
+
+    def _generate_llm_summary(self, file_path: str, content: str, file_symbols: "FileSymbols") -> str:
+        """Map-reduce LLM summary for large files."""
+        if ask is None:
+            return ""
+        chunks = self._summary_chunks(content, file_symbols)
+        if not chunks:
+            return ""
+
+        per_chunk_limit = max(400, self.summary_max_bytes // max(1, len(chunks)))
+        chunk_summaries: List[str] = []
+        for idx, chunk in enumerate(chunks, start=1):
+            prompt = (
+                f"Summarize this code chunk from {file_path} in 2-4 bullets. "
+                f"Focus on responsibilities, key classes/functions, and data flow. "
+                f"Limit to ~{per_chunk_limit} characters.\n\n"
+                f"Chunk {idx}/{len(chunks)}:\n{chunk}"
+            )
+            try:
+                summary = ask(prompt)
+                if summary:
+                    chunk_summaries.append(summary.strip())
+            except Exception:
+                continue
+
+        if not chunk_summaries:
+            return ""
+
+        reduce_prompt = (
+            f"Combine the following chunk summaries into a compact file-level summary "
+            f"(max {self.summary_max_bytes} characters). Use concise bullets."
+        )
+        try:
+            combined = ask(reduce_prompt + "\n\n" + "\n\n".join(chunk_summaries))
+        except Exception:
+            return ""
+        combined = combined.strip()
+        if len(combined.encode("utf-8")) > self.summary_max_bytes:
+            combined = combined[: self.summary_max_bytes] + "\n... (truncated)"
+        return combined
     
     def _group_nearby_lines(self, lines: List[int], max_gap: int = 10) -> List[List[int]]:
         """Group nearby line numbers together."""

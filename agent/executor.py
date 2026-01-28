@@ -18,6 +18,8 @@ try:
     from agent.refiner import create_refiner, CodeRefiner
     from memory.project_conventions import learn_project_conventions, ProjectConventionLearner
     from agent.performance import ContextPruner, get_global_monitor, LazyFileLoader
+    from agent.templates import find_template_for_task
+    TEMPLATES_AVAILABLE = True
     PERFORMANCE_AVAILABLE = True
 except ImportError:
     # Fallback if symbols module not available
@@ -40,6 +42,8 @@ except ImportError:
     ContextPruner = None  # type: ignore
     get_global_monitor = None  # type: ignore
     LazyFileLoader = None  # type: ignore
+    find_template_for_task = None  # type: ignore
+    TEMPLATES_AVAILABLE = False
     PERFORMANCE_AVAILABLE = False
 
 
@@ -66,12 +70,12 @@ def _read_files(base: Path, files: List[str], parallel: bool = True) -> Dict[str
         Dictionary mapping file paths to their contents.
     """
     contents: Dict[str, str] = {}
-    
-    if parallel and len(files) > 3:
-        # Use parallel reading for multiple files
+    use_parallel = parallel and len(files) > 3
+
+    if use_parallel:
         try:
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            
+
             def read_file(rel_path: str) -> tuple[str, Optional[str]]:
                 path = base / rel_path
                 if not path.exists():
@@ -81,28 +85,26 @@ def _read_files(base: Path, files: List[str], parallel: bool = True) -> Dict[str
                     return rel_path, content
                 except Exception:
                     return rel_path, None
-            
+
             with ThreadPoolExecutor(max_workers=min(8, len(files))) as executor:
                 futures = {executor.submit(read_file, rel_path): rel_path for rel_path in files}
                 for future in as_completed(futures):
                     rel_path, content = future.result()
                     if content is not None:
                         contents[rel_path] = content
+            return contents
         except ImportError:
-            # Fallback to sequential reading if concurrent.futures not available
-            parallel = False
-    
-    if not parallel:
-        # Sequential reading (fallback or for small file lists)
-        for rel_path in files:
-            path = base / rel_path
-            if not path.exists():
-                continue
-            try:
-                contents[rel_path] = path.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                continue
-    
+            pass
+
+    # Sequential reading (default for few files, or fallback)
+    for rel_path in files:
+        path = base / rel_path
+        if not path.exists():
+            continue
+        try:
+            contents[rel_path] = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
     return contents
 
 
@@ -122,6 +124,7 @@ def execute(
     symbols: Optional[List[str]] = None,
     relaxed_validation: bool = False,
     enable_llm: bool = False,
+    use_intelligent_context: Optional[bool] = None,
 ) -> ExecutorResult:
     """
     Produce diffs for requested files based on task and context.
@@ -193,9 +196,10 @@ def execute(
         return ExecutorResult(diffs=[], notes=notes, confidence=0.0)
 
     llm_callable = llm_fn or (lambda p: ask(p, model=model))
-    
-    # Use intelligent context builder if available, otherwise fall back to basic
-    use_intelligent_context = build_intelligent_context is not None
+
+    # Use intelligent context when available and not explicitly disabled (e.g. -f explicit files)
+    use_intelligent_context = use_intelligent_context if use_intelligent_context is not None else True
+    use_intelligent_context = use_intelligent_context and build_intelligent_context is not None
     if use_intelligent_context:
         try:
             context_obj = build_intelligent_context(
@@ -248,20 +252,31 @@ def execute(
         monitor = get_global_monitor()
         monitor.start("prompt_building")
     
-    # Determine if task is complex (needs chain-of-thought)
-    is_complex = len(files_to_modify) > 3 or len(task.split()) > 20
+    # Determine if task is complex (use CoT for multi-file refactors/creates or long tasks)
+    task_type_for_cot = None
+    if classify_task is not None:
+        try:
+            task_type_for_cot, _ = classify_task(task)
+        except Exception:
+            task_type_for_cot = None
+    is_multi_file = len(files_to_modify) > 2
+    is_long_task = len(task.split()) > 25
+    refactor_or_create = (TaskType.REFACTOR, TaskType.CREATE) if TaskType is not None else ()
+    is_complex_type = task_type_for_cot in refactor_or_create
+    is_complex = (is_multi_file and is_complex_type) or len(files_to_modify) > 3 or is_long_task
     use_cot = is_complex and get_chain_of_thought_prompt is not None
-    
+
     prompt = _build_prompt(
-        task, 
-        instruction, 
-        snippets, 
-        language, 
+        task,
+        instruction,
+        snippets,
+        language,
         mode,
         use_enhanced_prompts=True,
         use_few_shot=True,
         use_chain_of_thought=use_cot,
         conventions=conventions_text,
+        files_to_modify=files_to_modify,
     )
     # End prompt building monitoring
     if PERFORMANCE_AVAILABLE and get_global_monitor:
@@ -285,7 +300,10 @@ def execute(
 
     diffs = _extract_diffs(llm_output)
     if not diffs:
-        strict_prompt = prompt + "\nReturn ONLY unified diff. No prose. Use ---/+++ headers."
+        strict_prompt = (
+            prompt + "\n\n[IMPORTANT] Return ONLY the unified diff(s). "
+            "No markdown, no explanations, no prose. Start with --- path and +++ path, use @@ hunks."
+        )
         try:
             strict_output = llm_callable(strict_prompt)
             diffs = _extract_diffs(strict_output)
@@ -307,6 +325,29 @@ def execute(
         allowed_paths=files_to_modify,
         repo_root=repo_root,
     )
+
+    # Validation rejected diffs: retry once with explicit feedback
+    if not valid_diffs and diffs and not relaxed_validation:
+        feedback_prompt = (
+            prompt + "\n\n[RETRY] Your previous output had invalid diffs "
+            "(e.g. wrong format, disallowed paths, or missing @@ hunks). "
+            "Allowed files to modify: " + (", ".join(files_to_modify) if files_to_modify else "see context") + ". "
+            "Output ONLY valid unified diffs. Use ---/+++ and @@ -start,count +start,count @@."
+        )
+        try:
+            feedback_output = llm_callable(feedback_prompt)
+            diffs = _attach_paths(_extract_diffs(feedback_output))
+            valid_diffs = _validate_diffs(
+                diffs,
+                relaxed=False,
+                allowed_paths=files_to_modify,
+                repo_root=repo_root,
+            )
+            if valid_diffs:
+                llm_output = feedback_output
+        except Exception:
+            pass
+
     if not valid_diffs:
         notes = [
             "Diffs were malformed or exceeded safety limits.",
@@ -321,38 +362,32 @@ def execute(
             context_preview=snippets,
         )
 
-    # Apply project conventions if available
+    notes_list: List[str] = ["Generated diffs via LLM"]
     if ProjectConventionLearner:
         try:
             learner = ProjectConventionLearner(Path(repo_root))
-            # Try to load rules file
             rules_file = Path(repo_root) / ".lca-rules.yaml"
             if rules_file.exists():
                 learner.load_rules(rules_file)
             else:
-                # Learn from codebase
                 learner.learn_from_codebase(sample_size=20)
-            
-            # Enforce conventions on generated diffs
             for diff in valid_diffs:
                 file_path = diff.get("path", "")
                 if file_path:
                     full_path = Path(repo_root) / file_path
                     if full_path.exists():
                         content = full_path.read_text(encoding="utf-8", errors="replace")
-                        # Apply diff temporarily to check conventions
-                        # (In production, would apply diff in memory)
-                        enforced, violations = learner.enforce_conventions(content)
+                        _, violations = learner.enforce_conventions(content)
                         if violations:
-                            # Add note about convention violations
-                            notes.append(f"Convention check for {file_path}: {len(violations)} potential issues")
+                            notes_list.append(
+                                f"Convention check for {file_path}: {len(violations)} potential issues"
+                            )
         except Exception:
-            # If convention enforcement fails, continue without it
             pass
-    
+
     return ExecutorResult(
         diffs=valid_diffs,
-        notes=["Generated diffs via LLM"] + (notes if 'notes' in locals() else []),
+        notes=notes_list,
         confidence=0.6,
         prompt_excerpt=_excerpt(prompt),
         llm_excerpt=_excerpt(llm_output),
@@ -610,67 +645,82 @@ def build_context(
 def _build_prompt(
     task: str,
     instruction: Optional[str],
-    snippets: List[Dict[str, str]],
+    snippets: List[Dict[str, Any]],
     language: Optional[str],
     mode: Optional[str],
     use_enhanced_prompts: bool = True,
     use_few_shot: bool = True,
     use_chain_of_thought: bool = False,
     conventions: Optional[str] = None,
+    files_to_modify: Optional[List[str]] = None,
 ) -> str:
     """
     Build a prompt for the LLM to generate diffs with enhanced prompt engineering.
     """
     mode = mode or _infer_mode(task)
-    
-    # Build context string from snippets
-    snippet_blocks = "\n".join([f"--- {s['path']} ---\n{s['snippet']}" for s in snippets])
-    
+
+    # Build context string from snippets; include [test] / [related] etc. when available
+    def _block(s: Dict[str, Any]) -> str:
+        path = s.get("path", "")
+        typ = s.get("type", "")
+        suffix = f" [{typ}]" if typ and typ != "code" else ""
+        return f"--- {path}{suffix} ---\n{s.get('snippet', '')}"
+
+    snippet_blocks = "\n".join(_block(s) for s in snippets)
+
+    # Allowed-files line (reduces wrong-file edits)
+    allowed_files_line = ""
+    if files_to_modify:
+        allowed_files_line = (
+            f"\n\nAllowed files to modify (only these): {', '.join(files_to_modify)}. "
+            "Use these exact paths in ---/+++ headers."
+        )
+
+    def _append_format_and_return(base: str) -> str:
+        if instruction:
+            base += f"\n\nAdditional instruction: {instruction}"
+        base += allowed_files_line
+        if mode:
+            base += f"\n\nMode: {mode}"
+        lang_line = f"Language/framework hint: {language}" if language else "Language/framework hint: unknown"
+        base += f"\n{lang_line}"
+        base += "\n\nGenerate a unified diff for each file that needs changes."
+        base += "\nFormat: --- path/to/file\n+++ path/to/file"
+        base += "\n@@ -start,count +start,count @@\n context\n-old\n+new"
+        base += "\n\nDo not modify test files unless explicitly requested."
+        base += "\n\nOutput only the unified diff(s). No markdown, no prose before or after."
+        if "create" in task.lower() and instruction is None:
+            base += "\nIf unsure, propose a minimal stub with clear anchors."
+        return base
+
+    # Template-matched task (add function, fix bug, refactor, add test, update docs)
+    if use_enhanced_prompts and TEMPLATES_AVAILABLE and find_template_for_task is not None:
+        tpl = find_template_for_task(task)
+        if tpl is not None:
+            try:
+                base = tpl.generate_prompt(task, context=snippet_blocks)
+                return _append_format_and_return(base)
+            except Exception:
+                pass
+
     # Use enhanced prompts if available
     if use_enhanced_prompts and classify_task is not None and get_task_type_prompt is not None:
         try:
-            task_type, confidence = classify_task(task)
-            
-            # Use chain-of-thought for complex tasks
+            task_type, _ = classify_task(task)
+
             if use_chain_of_thought and get_chain_of_thought_prompt is not None:
                 base_prompt = get_chain_of_thought_prompt(task, snippet_blocks, is_complex=True)
-            # Use few-shot examples if available
             elif use_few_shot and get_prompt_with_examples is not None:
-                base_prompt = get_prompt_with_examples(task, task_type, snippet_blocks)
+                base_prompt = get_prompt_with_examples(
+                    task, task_type, snippet_blocks, conventions=conventions
+                )
             else:
                 base_prompt = get_task_type_prompt(task, task_type, snippet_blocks, conventions)
-            
-            # Add instruction override if provided
-            if instruction:
-                base_prompt += f"\n\nAdditional instruction: {instruction}"
-            
-            # Add mode and language hints
-            if mode:
-                base_prompt += f"\n\nMode: {mode}"
-            lang_line = f"Language/framework hint: {language}" if language else "Language/framework hint: unknown"
-            base_prompt += f"\n{lang_line}"
-            
-            # Add format instructions
-            base_prompt += "\n\nGenerate a unified diff for each file that needs changes."
-            base_prompt += "\nFormat: --- path/to/file"
-            base_prompt += "\n+++ path/to/file"
-            base_prompt += "\n@@ -start,count +start,count @@"
-            base_prompt += "\n context line"
-            base_prompt += "\n-old line"
-            base_prompt += "\n+new line"
-            base_prompt += "\n\nReturn only the unified diff(s), no explanations."
-            
-            # Add anchor hint for create tasks
-            anchor_hint = ""
-            if "create" in task.lower() and instruction is None:
-                anchor_hint = "\nIf unsure, propose a minimal stub with clear anchors."
-            base_prompt += anchor_hint
-            
-            return base_prompt
+
+            return _append_format_and_return(base_prompt)
         except Exception:
-            # Fall back to basic prompt on error
             pass
-    
+
     # Basic prompt (fallback)
     anchor_hint = ""
     if "create" in task.lower() and instruction is None:
@@ -683,22 +733,20 @@ def _build_prompt(
         f"Instruction: {instruction or 'none'}\n"
         f"Mode: {mode}\n"
         f"{lang_line}\n"
-        "Guardrails: Do not modify tests unless explicitly requested. Keep changes minimal and focused.\n"
+        + (f"Allowed files to modify: {', '.join(files_to_modify)}.\n" if files_to_modify else "")
+        + "Guardrails: Do not modify tests unless explicitly requested. Keep changes minimal and focused.\n"
         "Context snippets:\n"
         f"{snippet_blocks}\n"
-        "Plan format:\n"
-        "- Rationale bullets\n"
-        "- Tests to run\n"
-        "Then output unified diff(s) starting with ---/+++ headers. No extra text beyond plan + diffs."
+        "Plan format: 2–3 rationale bullets, then unified diff(s) with ---/+++ headers. No extra text after diffs."
         f"{anchor_hint}"
     )
 
 
-def _extract_diffs(text: str) -> List[Dict[str, str]]:
+def _extract_diffs_from_text(raw: str) -> List[Dict[str, str]]:
+    """Parse unified diffs from raw text (line-by-line)."""
     diffs: List[Dict[str, str]] = []
-    lines = text.splitlines()
+    lines = raw.splitlines()
     current: List[str] = []
-    # Allow a short plan section, then diffs.
     started = False
 
     for line in lines:
@@ -710,18 +758,33 @@ def _extract_diffs(text: str) -> List[Dict[str, str]]:
         if current or line.startswith("--- "):
             current.append(line)
         elif started:
-            # Once diffs started, collect all lines
             current.append(line)
 
     if current:
         diffs.append({"path": "", "diff": "\n".join(current)})
 
-    # Filter out entries that don't look like a diff
     valid = []
     for d in diffs:
-        if "--- " in d["diff"] and "+++" in d["diff"]:
+        if "--- " in d["diff"] and "+++" in d["diff"] and "@@" in d["diff"]:
             valid.append(d)
     return valid
+
+
+def _extract_diffs(text: str) -> List[Dict[str, str]]:
+    """Extract unified diffs from LLM output. Tries raw text first, then ```diff or ``` blocks."""
+    out = _extract_diffs_from_text(text)
+    if out:
+        return out
+
+    # Fallback: extract from ```diff ... ``` or ``` ... ``` code blocks
+    for pattern in (r"```(?:diff)?\s*\n?(.*?)```", r"```\s*\n?(.*?)```"):
+        for m in re.finditer(pattern, text, re.DOTALL):
+            block = m.group(1).strip()
+            if "--- " in block and "+++" in block and "@@" in block:
+                out = _extract_diffs_from_text(block)
+                if out:
+                    return out
+    return []
 
 
 def _validate_diffs(

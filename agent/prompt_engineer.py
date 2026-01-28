@@ -1,5 +1,7 @@
 """Enhanced prompt engineering for different task types."""
 
+from __future__ import annotations
+
 from typing import Iterator, Optional
 from core.llm import ask_stream
 from agent.task_classifier import TaskType, classify_task
@@ -194,7 +196,10 @@ Step-by-step approach:
 4. **Implement**: Generate the code changes
 5. **Verify**: Ensure the changes are correct and complete
 
-Think through each step before generating the diff.
+Output format (strict):
+- First, 2–3 brief plan bullets (optional).
+- Then output ONLY the unified diff(s). No explanations, no markdown, no text after the diff.
+- Use --- path/to/file and +++ path/to/file headers. Use @@ -start,count +start,count @@ for hunks.
 
 Generate a unified diff that implements the solution."""
 
@@ -246,10 +251,27 @@ Diff:
 +    return date.strftime("%Y-%m-%d")
 +
 """,
+    TaskType.MODIFY: """
+Example 1: Modifying existing code
+Task: "Add a timeout parameter to fetch_url"
+Context: Shows fetch_url function
+Diff:
+--- client.py
++++ client.py
+@@ -3,6 +3,7 @@
+-def fetch_url(url: str) -> str:
++def fetch_url(url: str, timeout: int = 30) -> str:
+     import httpx
+-    r = httpx.get(url)
++    r = httpx.get(url, timeout=timeout)
+     return r.text
+""",
 }
 
 
-def get_prompt_with_examples(task: str, task_type: TaskType, context: str) -> str:
+def get_prompt_with_examples(
+    task: str, task_type: TaskType, context: str, conventions: Optional[str] = None
+) -> str:
     """
     Get a prompt with few-shot examples for the task type.
     
@@ -257,11 +279,12 @@ def get_prompt_with_examples(task: str, task_type: TaskType, context: str) -> st
         task: The task description.
         task_type: The task type.
         context: Codebase context.
+        conventions: Optional project conventions to follow.
     
     Returns:
         Prompt with examples.
     """
-    base_prompt = get_task_type_prompt(task, task_type, context)
+    base_prompt = get_task_type_prompt(task, task_type, context, conventions)
     
     if task_type in FEW_SHOT_EXAMPLES:
         example = FEW_SHOT_EXAMPLES[task_type]

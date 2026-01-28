@@ -915,6 +915,7 @@ def run(
     def _run_one(task: str) -> None:
         run_started_at = time.time()
         log_path = Path(repo_root) / "logs" / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+        files_explicit = bool(files)
 
         # Conversation manager already initialized above
 
@@ -1351,6 +1352,7 @@ def run(
                         symbols=symbol_list or None,
                         relaxed_validation=relaxed_validation,
                         enable_llm=True,
+                        use_intelligent_context=not files_explicit,
                     )
                     
                     if subtask_result.diffs:
@@ -1446,6 +1448,7 @@ def run(
                             symbols=symbol_list or None,
                             relaxed_validation=relaxed_validation,
                             enable_llm=True,
+                            use_intelligent_context=not files_explicit,
                         )
                 except Exception:
                     # If refactoring fails, fall back to normal execution
@@ -1464,8 +1467,28 @@ def run(
                         symbols=symbol_list or None,
                         relaxed_validation=relaxed_validation,
                         enable_llm=True,
+                        use_intelligent_context=not files_explicit,
                     )
- 
+            else:
+                # Non-refactoring path: execute directly
+                result = execute(
+                    task,
+                    plan.files_to_read,
+                    plan.files_to_modify,
+                    repo_root,
+                    instruction=exec_instruction or None,
+                    context_paths=context_files,
+                    max_context_files=max_files,
+                    language=lang or None,
+                    model=model or None,
+                    mode=None if mode == "auto" else mode,
+                    llm_fn=_wrapped_llm,
+                    symbols=symbol_list or None,
+                    relaxed_validation=relaxed_validation,
+                    enable_llm=True,
+                    use_intelligent_context=not files_explicit,
+                )
+
             # Validate diffs before showing them
             if result.diffs:
                 validated_diffs = []
@@ -1602,6 +1625,7 @@ def run(
                             symbols=symbol_list or None,
                             relaxed_validation=relaxed_validation,
                             enable_llm=True,
+                            use_intelligent_context=not files_explicit,
                         )
                         
                         if refinement_result.diffs:

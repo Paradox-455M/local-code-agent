@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Set, Optional, Tuple
+from typing import Dict, List, Set, Optional, Tuple, Any
 from collections import defaultdict
 
 try:
@@ -55,6 +55,34 @@ class CallGraphBuilder:
         self.codebase_graph = codebase_graph
         self.call_graph = CallGraph()
         self._build_call_graph()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize call graph to a dict for caching."""
+        calls: Dict[str, List[Dict[str, Any]]] = {}
+        for callee, sites in self.call_graph.calls.items():
+            calls[callee] = [asdict(site) for site in sites]
+        return {
+            "calls": calls,
+            "callers": self.call_graph.callers,
+            "callees": self.call_graph.callees,
+        }
+
+    @classmethod
+    def from_dict(
+        cls, repo_root: Path, codebase_graph: Optional[CodebaseGraph], data: Dict[str, Any]
+    ) -> "CallGraphBuilder":
+        """Rehydrate call graph builder from cached dict."""
+        obj = cls.__new__(cls)
+        obj.repo_root = Path(repo_root).resolve()
+        obj.codebase_graph = codebase_graph
+        obj.call_graph = CallGraph()
+        obj.call_graph.calls = {
+            callee: [CallSite(**site) for site in sites]
+            for callee, sites in data.get("calls", {}).items()
+        }
+        obj.call_graph.callers = data.get("callers", {})
+        obj.call_graph.callees = data.get("callees", {})
+        return obj
     
     def _build_call_graph(self) -> None:
         """Build call graph by analyzing all Python files."""

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Set, Optional, Tuple
+from typing import Dict, List, Set, Optional, Tuple, Any
 from collections import defaultdict
 
 try:
@@ -87,6 +87,57 @@ class CodebaseGraph:
         self.symbol_index: Dict[str, List[CodeLocation]] = {}  # Symbol name -> locations
         self.dependency_graph: Optional[DependencyGraph] = None
         self._build_graph()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize graph to a dict for caching."""
+        modules: Dict[str, Dict[str, Any]] = {}
+        for path, mod in self.modules.items():
+            mod_dict = asdict(mod)
+            modules[path] = mod_dict
+
+        functions = {k: asdict(v) for k, v in self.functions.items()}
+        classes = {k: asdict(v) for k, v in self.classes.items()}
+        symbol_index = {
+            name: [asdict(loc) for loc in locs] for name, locs in self.symbol_index.items()
+        }
+        return {
+            "modules": modules,
+            "functions": functions,
+            "classes": classes,
+            "symbol_index": symbol_index,
+        }
+
+    @classmethod
+    def from_dict(cls, repo_root: Path, data: Dict[str, Any]) -> "CodebaseGraph":
+        """Rehydrate graph from cached dict."""
+        obj = cls.__new__(cls)
+        obj.repo_root = Path(repo_root).resolve()
+        obj.dependency_graph = None
+
+        modules: Dict[str, ModuleInfo] = {}
+        for path, mod in data.get("modules", {}).items():
+            symbols = [Symbol(**s) for s in mod.get("symbols", [])]
+            modules[path] = ModuleInfo(
+                path=mod.get("path", path),
+                symbols=symbols,
+                imports=mod.get("imports", []),
+                imported_by=mod.get("imported_by", []),
+                test_files=mod.get("test_files", []),
+                source_file=mod.get("source_file"),
+            )
+        obj.modules = modules
+
+        obj.functions = {
+            k: FunctionInfo(**v) for k, v in data.get("functions", {}).items()
+        }
+        obj.classes = {
+            k: ClassInfo(**v) for k, v in data.get("classes", {}).items()
+        }
+        obj.symbol_index = {
+            name: [CodeLocation(**loc) for loc in locs]
+            for name, locs in data.get("symbol_index", {}).items()
+        }
+        return obj
     
     def _build_graph(self) -> None:
         """Build the complete knowledge graph."""

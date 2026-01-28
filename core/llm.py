@@ -29,6 +29,8 @@ OLLAMA_HOST: Final[str] = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 REQUEST_TIMEOUT: Final[float] = 300.0  # Increased timeout for longer generations
 LOW_TEMPERATURE: Final[float] = 0.1
 MAX_RETRIES: Final[int] = int(os.getenv("LCA_MAX_RETRIES", "3"))
+# Max output tokens for code-gen; -1 = unlimited. Set LCA_NUM_PREDICT=8192 if diffs are truncated.
+NUM_PREDICT: Final[int] = int(os.getenv("LCA_NUM_PREDICT", "-1"))
 RETRY_BACKOFF_BASE: Final[float] = 1.5  # Exponential backoff multiplier
 RETRYABLE_STATUS_CODES: Final[set[int]] = {429, 500, 502, 503, 504}  # Retry on these HTTP status codes
 
@@ -229,12 +231,19 @@ def ask_stream(prompt: str, model: str | None = None) -> Iterator[str]:
         ) from exc
 
 
+def _ollama_options() -> dict:
+    opts: dict = {"temperature": LOW_TEMPERATURE}
+    if NUM_PREDICT >= 0:
+        opts["num_predict"] = NUM_PREDICT
+    return opts
+
+
 def _call_generate(client: httpx.Client, prompt: str, model_override: str | None) -> str:
     payload = {
         "model": model_override or config.model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": LOW_TEMPERATURE},
+        "options": _ollama_options(),
     }
     response = client.post("/api/generate", json=payload)
     response.raise_for_status()
@@ -250,7 +259,7 @@ def _call_generate_stream(client: httpx.Client, prompt: str, model_override: str
         "model": model_override or config.model,
         "prompt": prompt,
         "stream": True,
-        "options": {"temperature": LOW_TEMPERATURE},
+        "options": _ollama_options(),
     }
     with client.stream("POST", "/api/generate", json=payload) as response:
         response.raise_for_status()
@@ -280,7 +289,7 @@ def _call_chat(client: httpx.Client, prompt: str, model_override: str | None) ->
         "model": model_override or config.model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "options": {"temperature": LOW_TEMPERATURE},
+        "options": _ollama_options(),
     }
     response = client.post("/api/chat", json=payload)
     response.raise_for_status()
@@ -300,7 +309,7 @@ def _call_chat_stream(client: httpx.Client, prompt: str, model_override: str | N
         "model": model_override or config.model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": True,
-        "options": {"temperature": LOW_TEMPERATURE},
+        "options": _ollama_options(),
     }
     with client.stream("POST", "/api/chat", json=payload) as response:
         response.raise_for_status()

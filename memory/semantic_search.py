@@ -62,7 +62,14 @@ class SemanticCodeSearch:
         self.embeddings_cache: Dict[str, List[float]] = {}
         self._embedding_model = None
         self._vector_db = None
+        self._model_id = "unknown"
+        self._file_hashes: Dict[str, str] = {}
+        self._index_dir = self.repo_root / ".lca" / "semantic_index"
+        self._index_dir.mkdir(parents=True, exist_ok=True)
+        self._meta_path = self._index_dir / "index_meta.json"
+        self._chunks_path = self._index_dir / "chunks.jsonl"
         self._initialize_embeddings()
+        self._load_index()
     
     def _initialize_embeddings(self) -> None:
         """Initialize embedding model."""
@@ -70,6 +77,7 @@ class SemanticCodeSearch:
         try:
             from sentence_transformers import SentenceTransformer
             self._embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            self._model_id = "sentence-transformers:all-MiniLM-L6-v2"
             return
         except ImportError:
             pass
@@ -82,6 +90,7 @@ class SemanticCodeSearch:
                 response = httpx.get("http://127.0.0.1:11434/api/tags", timeout=1.0)
                 if response.status_code == 200:
                     self._embedding_model = "ollama"
+                    self._model_id = "ollama:nomic-embed-text"
                     return
             except Exception:
                 pass
@@ -90,6 +99,61 @@ class SemanticCodeSearch:
         
         # Fallback: simple keyword-based similarity
         self._embedding_model = "keyword"
+        self._model_id = "keyword"
+
+    def _load_index(self) -> None:
+        """Load persisted semantic index if compatible."""
+        if not self._meta_path.exists() or not self._chunks_path.exists():
+            return
+        try:
+            meta = json.loads(self._meta_path.read_text(encoding="utf-8"))
+            if meta.get("model_id") != self._model_id:
+                return
+            self._file_hashes = meta.get("file_hashes", {})
+            chunks: List[CodeChunk] = []
+            with self._chunks_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    data = json.loads(line)
+                    chunk = CodeChunk(
+                        file_path=data["file_path"],
+                        content=data["content"],
+                        start_line=data["start_line"],
+                        end_line=data["end_line"],
+                        symbol_name=data.get("symbol_name"),
+                    )
+                    chunk.embedding = data.get("embedding")
+                    chunks.append(chunk)
+            self.chunks = chunks
+        except Exception:
+            self._file_hashes = {}
+            self.chunks = []
+
+    def _save_index(self) -> None:
+        """Persist semantic index to disk."""
+        try:
+            meta = {
+                "version": 1,
+                "model_id": self._model_id,
+                "file_hashes": self._file_hashes,
+            }
+            self._meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            with self._chunks_path.open("w", encoding="utf-8") as f:
+                for chunk in self.chunks:
+                    f.write(json.dumps({
+                        "file_path": chunk.file_path,
+                        "content": chunk.content,
+                        "start_line": chunk.start_line,
+                        "end_line": chunk.end_line,
+                        "symbol_name": chunk.symbol_name,
+                        "embedding": chunk.embedding,
+                    }) + "\n")
+        except Exception:
+            pass
+
+    def _file_hash(self, content: str) -> str:
+        return hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()
     
     def _get_embedding(self, text: str) -> List[float]:
         """
@@ -178,20 +242,43 @@ class SemanticCodeSearch:
         """
         repo_files = scan_repo(str(self.repo_root))
         python_files = [f for f in repo_files if f.endswith(".py")]
-        
+
+        # Remove deleted files from cache
+        cached_files = set(self._file_hashes.keys())
+        current_files = set(python_files)
+        removed = cached_files - current_files
+        if removed:
+            self.chunks = [c for c in self.chunks if c.file_path not in removed]
+            for f in removed:
+                self._file_hashes.pop(f, None)
+
         for file_path in python_files:
-            self._index_file(file_path, chunk_size)
+            full_path = self.repo_root / file_path
+            try:
+                content = full_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            content_hash = self._file_hash(content)
+            if self._file_hashes.get(file_path) == content_hash:
+                continue
+            # Remove existing chunks for this file and re-index
+            self.chunks = [c for c in self.chunks if c.file_path != file_path]
+            self._index_file(file_path, chunk_size, content=content)
+            self._file_hashes[file_path] = content_hash
+
+        self._save_index()
     
-    def _index_file(self, file_path: str, chunk_size: int) -> None:
+    def _index_file(self, file_path: str, chunk_size: int, content: Optional[str] = None) -> None:
         """Index a single file."""
         full_path = self.repo_root / file_path
         if not full_path.exists():
             return
         
-        try:
-            content = full_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            return
+        if content is None:
+            try:
+                content = full_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return
         
         lines = content.splitlines()
         

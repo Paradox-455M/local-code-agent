@@ -12,8 +12,12 @@ try:
     from memory.knowledge_graph import build_codebase_graph, CodebaseGraph
     from memory.call_graph import build_call_graph, CallGraphBuilder
     from memory.semantic_search import create_semantic_search, SemanticCodeSearch
+    from memory.graph_cache import GraphCache
+    from core.config import config
     ADVANCED_FEATURES_AVAILABLE = True
 except ImportError:
+    config = None  # type: ignore
+    GraphCache = None  # type: ignore
     # Fallback if advanced features not available
     def score_file_by_symbols(*args, **kwargs):  # type: ignore
         return 0.0
@@ -152,15 +156,22 @@ def _choose_files(
     call_graph = None
     semantic_search = None
     
-    if ADVANCED_FEATURES_AVAILABLE and repo_root:
+    use_kg = config is not None and getattr(config, "use_knowledge_graph", True)
+    if ADVANCED_FEATURES_AVAILABLE and repo_root and use_kg:
         try:
-            # Build knowledge graph for deep understanding (automatic)
-            knowledge_graph = build_codebase_graph(Path(repo_root))
-            call_graph = build_call_graph(Path(repo_root), knowledge_graph)
+            if GraphCache:
+                cached = GraphCache(Path(repo_root)).load()
+                if cached:
+                    knowledge_graph, call_graph = cached
+            if knowledge_graph is None:
+                knowledge_graph = build_codebase_graph(Path(repo_root))
+            if call_graph is None and knowledge_graph is not None:
+                call_graph = build_call_graph(Path(repo_root), knowledge_graph)
             semantic_search = create_semantic_search(Path(repo_root))
-            semantic_search.index_codebase()  # Index if not already indexed
+            semantic_search.index_codebase()
+            if GraphCache and knowledge_graph and call_graph:
+                GraphCache(Path(repo_root)).save(knowledge_graph, call_graph)
         except Exception:
-            # If advanced features fail, continue with basic search
             pass
 
     # Step 1: Semantic search for relevant files (automatic)
