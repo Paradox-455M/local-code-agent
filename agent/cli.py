@@ -37,6 +37,7 @@ from memory.conversation import get_conversation_manager
 from memory.feedback import collect_feedback, analyze_feedback_patterns
 from tools.apply_patch import apply_patch, PatchError
 from core.exceptions import LocalCodeAgentError
+from typer.models import OptionInfo
 
 # Sprint 3 imports
 try:
@@ -738,9 +739,43 @@ def run(
     """
     Run the agent workflow: scan -> plan -> confirm -> execute -> confirm -> apply -> review.
     """
-    # Normalize debug_error when run() is invoked programmatically (OptionInfo default)
-    if not isinstance(debug_error, str):
-        debug_error = ""
+    def _coerce_option(value: Any, default: Any) -> Any:
+        return default if isinstance(value, OptionInfo) else value
+
+    # Normalize OptionInfo defaults when run() is invoked programmatically
+    debug_error = _coerce_option(debug_error, "")
+    auto_test = _coerce_option(auto_test, False)
+    version = _coerce_option(version, False)
+    dry_run = _coerce_option(dry_run, False)
+    plan_only = _coerce_option(plan_only, False)
+    mock_llm = _coerce_option(mock_llm, False)
+    selective_apply = _coerce_option(selective_apply, False)
+    run_pytest = _coerce_option(run_pytest, False)
+    run_ruff = _coerce_option(run_ruff, False)
+    run_mypy = _coerce_option(run_mypy, False)
+    run_py_compile = _coerce_option(run_py_compile, False)
+    show_plan = _coerce_option(show_plan, False)
+    show_reasoning = _coerce_option(show_reasoning, True)
+    preview_context = _coerce_option(preview_context, True)
+    quick_review = _coerce_option(quick_review, False)
+    enhance = _coerce_option(enhance, False)
+    iterative = _coerce_option(iterative, False)
+    allow_outside_repo = _coerce_option(allow_outside_repo, False)
+    watch = _coerce_option(watch, False)
+    session = _coerce_option(session, None)
+    files = _coerce_option(files, None)
+    targets = _coerce_option(targets, None)
+    dirs = _coerce_option(dirs, None)
+    context = _coerce_option(context, None)
+    context_glob = _coerce_option(context_glob, None)
+    symbols = _coerce_option(symbols, "")
+    instruction = _coerce_option(instruction, "")
+    lang = _coerce_option(lang, "")
+    model = _coerce_option(model, "")
+    mode = _coerce_option(mode, "auto")
+    write_patch = _coerce_option(write_patch, "")
+    relaxed_validation = _coerce_option(relaxed_validation, False)
+    allow_outside_repo = bool(allow_outside_repo)
 
     # Input validation
     repo_root = str(config.repo_root)

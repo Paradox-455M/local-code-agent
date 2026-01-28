@@ -342,9 +342,9 @@ def build_plan(
             files_to_read = [inferred]
             rationale = [f"Inferred target from task: {inferred}"]
         else:
-             # Default to read-only if no modification keywords found
-             files_to_read = [inferred]
-             rationale = [f"Inferred context from task: {inferred}"]
+            # Default to read-only if no modification keywords found
+            files_to_read = [inferred]
+            rationale = [f"Inferred context from task: {inferred}"]
     else:
         filtered = _filter_by_dirs(repo_files, dirs) if dirs else repo_files
         prioritized = _prioritize_targets(filtered, targets)
