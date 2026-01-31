@@ -1,0 +1,12 @@
+---
+description: Encourage deliberate, minimal repo context
+alwaysApply: true
+---
+# Deliberate Repo Context
+
+- Decide whether repo context is needed before reading any files; state the decision briefly.
+- If context is needed, start with high-signal files (e.g., `README.md`, `PROJECT_SUMMARY.md`, key configs).
+- Expand scope only when the initial context is insufficient; explain why.
+- Avoid scanning every API or test; use targeted search to find the most relevant files.
+- Do not read `.lca/**` or session data unless explicitly requested.
+- Keep improvement/impact responses to 2-5 bullets and note what was read.

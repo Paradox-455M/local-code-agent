@@ -60,6 +60,8 @@ class Config:
     # Git integration
     auto_commit: bool = os.getenv("LCA_AUTO_COMMIT", "false").lower() == "true"
     auto_branch: bool = os.getenv("LCA_AUTO_BRANCH", "false").lower() == "true"
+    # Planning: always show plan and require approval before proceeding
+    always_plan: bool = os.getenv("LCA_ALWAYS_PLAN", "false").lower() in ("true", "1", "yes")
     # Performance: skip KG/semantic for faster runs (env: LCA_FAST_MODE, LCA_USE_KNOWLEDGE_GRAPH)
     fast_mode: bool = os.getenv("LCA_FAST_MODE", "false").lower() in ("true", "1", "yes")
     use_knowledge_graph: bool = os.getenv("LCA_USE_KNOWLEDGE_GRAPH", "true").lower() in ("true", "1", "yes")
@@ -92,6 +94,8 @@ class Config:
                         self.model = agent_cfg["model"]
                     if "max_files" in agent_cfg:
                         self.max_plan_files = agent_cfg["max_files"]
+                if "always_plan" in agent_cfg and not os.getenv("LCA_ALWAYS_PLAN"):
+                    self.always_plan = bool(agent_cfg["always_plan"])
         except Exception:
             # Silently fail if config file not available
             pass

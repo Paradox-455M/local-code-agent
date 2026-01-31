@@ -111,6 +111,9 @@ def validate_config(config: Dict[str, Any]) -> tuple[bool, list[str]]:
         if "max_files" in agent_config:
             if not isinstance(agent_config["max_files"], int) or agent_config["max_files"] < 1:
                 errors.append("agent.max_files must be a positive integer")
+        if "always_plan" in agent_config:
+            if not isinstance(agent_config["always_plan"], bool):
+                errors.append("agent.always_plan must be a boolean")
         
         if "model" in agent_config:
             if not isinstance(agent_config["model"], str):
@@ -153,6 +156,9 @@ def create_default_config(repo_root: str) -> Path:
 [agent]
 # Maximum number of files to include in context
 max_files = 5
+
+# Always show plan and require approval before proceeding
+# always_plan = false
 
 # Default model to use (overrides LCA_MODEL env var)
 # model = "llama3.2"

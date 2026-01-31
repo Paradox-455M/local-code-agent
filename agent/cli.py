@@ -384,14 +384,39 @@ def _summarize_diff(diff_text: str) -> dict:
     return {"path": path, "added": added, "removed": removed}
 
 
+def _format_plan_summary(plan: Any) -> str:
+    def _join(items: list[str]) -> str:
+        return ", ".join(items) if items else "none"
+
+    steps = "; ".join(plan.steps) if plan.steps else "none"
+    tests = "; ".join(plan.tests_to_run) if getattr(plan, "tests_to_run", None) else "none"
+    return "\n".join(
+        [
+            f"- **Goal**: {plan.goal}",
+            f"- **Read**: {_join(plan.files_to_read)}",
+            f"- **Modify**: {_join(plan.files_to_modify)}",
+            f"- **Steps**: {steps}",
+            f"- **Risk**: {plan.risk_level}",
+            f"- **Tests**: {tests}",
+        ]
+    )
+
+
 def _elapsed(started_at: float) -> float:
     return time.time() - started_at
 
 
-def _event(started_at: float, message: str) -> None:
+def _event(started_at: float, message: str, status: str | None = None) -> None:
     """Print a progress event."""
-    # Use show_plan as proxy for verbose mode (defined in run() function scope)
-    # For now, always show timing to avoid scope issues
+    elapsed = _elapsed(started_at)
+    style_map = {
+        "info": "cyan",
+        "success": "green",
+        "warning": "yellow",
+        "error": "red",
+    }
+    style = style_map.get(status or "", "dim")
+    console.print(f"[{style}]{elapsed:>6.1f}s[/{style}] {message}")
 
 
 def _decision(message: str) -> bool:
@@ -493,6 +518,12 @@ def main(
     ),
     show_plan: bool = typer.Option(
         False, "--show-plan/--no-show-plan", help="Display planner JSON and technical details", show_default=False
+    ),
+    always_plan: bool = typer.Option(
+        config.always_plan,
+        "--always-plan/--no-always-plan",
+        help="Always show plan and require approval before proceeding",
+        show_default=True,
     ),
     show_reasoning: bool = typer.Option(
         True, "--show-reasoning/--no-show-reasoning", help="Display LLM prompt/response excerpts", show_default=True
@@ -596,6 +627,7 @@ def main(
                 run_mypy=run_mypy,
                 run_py_compile=run_py_compile,
                 show_plan=show_plan,
+                always_plan=always_plan,
                 show_reasoning=show_reasoning,
                 preview_context=preview_context,
                 symbols=symbols,
@@ -634,6 +666,7 @@ def main(
                 run_mypy=run_mypy,
                 run_py_compile=run_py_compile,
                 show_plan=show_plan,
+                always_plan=always_plan,
                 show_reasoning=show_reasoning,
                 preview_context=preview_context,
                 symbols=symbols,
@@ -680,6 +713,12 @@ def run(
     ),
     show_plan: bool = typer.Option(
         False, "--show-plan/--no-show-plan", help="Display planner JSON and technical details", show_default=False
+    ),
+    always_plan: bool = typer.Option(
+        config.always_plan,
+        "--always-plan/--no-always-plan",
+        help="Always show plan and require approval before proceeding",
+        show_default=True,
     ),
     show_reasoning: bool = typer.Option(
         True, "--show-reasoning/--no-show-reasoning", help="Display LLM prompt/response excerpts", show_default=True
@@ -755,6 +794,7 @@ def run(
     run_mypy = _coerce_option(run_mypy, False)
     run_py_compile = _coerce_option(run_py_compile, False)
     show_plan = _coerce_option(show_plan, False)
+    always_plan = _coerce_option(always_plan, config.always_plan)
     show_reasoning = _coerce_option(show_reasoning, True)
     preview_context = _coerce_option(preview_context, True)
     quick_review = _coerce_option(quick_review, False)
@@ -1010,6 +1050,9 @@ def run(
 
         if show_plan:
             console.print(Panel(Syntax(plan_json, "json", word_wrap=True), title="[bold]Plan JSON[/bold]", border_style="green"))
+        elif always_plan:
+            summary = _format_plan_summary(plan)
+            console.print(Panel(Markdown(summary), title="[bold]Plan Summary[/bold]", border_style="green", padding=(1, 2)))
 
         # Only show technical details if verbose mode
         if show_plan:
@@ -1257,7 +1300,7 @@ def run(
             context_files = list(dict.fromkeys(context_files + extra))
             console.print(f"[dim]Context glob matched {len(extra)} files[/dim]")
 
-        if not is_conversational:
+        if not is_conversational and not always_plan:
             if not _decision("Proceed to generate changes?"):
                 console.print("[yellow]Aborted.[/yellow]")
                 raise typer.Exit(code=0)

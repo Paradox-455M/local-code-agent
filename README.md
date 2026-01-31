@@ -52,6 +52,7 @@ pip install -e .
 - Post-check: `--post-check "python -m py_compile main.py"` runs after apply.
 - Selective apply: `--selective-apply` to approve each diff before patching.
 - Show plan/reasoning: defaults ON; use `--no-show-plan` / `--no-show-reasoning` to hide.
+- Always plan first: `--always-plan` shows a brief plan summary and proceeds automatically (use `--show-plan` for full JSON). Apply confirmation still appears before patching.
 - Preview context: defaults ON; use `--no-preview-context` to hide. `--symbols foo,bar` prioritizes symbols.
 - Export patch: `--write-patch out.diff` to save diffs without applying.
 - Mock replay: `--mock-from saved.jsonl` to replay stored LLM outputs.
